@@ -2,6 +2,8 @@
 
 Chrome extension that bulk-deletes unpinned Gemini chats and cleans up your chat history.
 
+Repository: https://github.com/KeplerXG/gemini-chat-cleaner-extension
+
 ## Features
 
 - One-click **Delete Unpinned Now** from the extension popup
