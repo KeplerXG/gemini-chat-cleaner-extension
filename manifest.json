@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "Gemini Chat Cleaner",
+  "description": "Delete all unpinned Gemini chat messages and clean up history",
+  "action": {
+    "default_popup": "src/pages/popup/index.html",
+    "default_icon": {
+      "32": "src/assets/img/icon-32.png"
+    }
+  },
+  "icons": {
+    "128": "src/assets/img/icon-128.png"
+  },
+  "permissions": [
+    "storage",
+    "tabs"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://gemini.google.com/*"
+      ],
+      "js": [
+        "src/pages/content/index.tsx"
+      ]
+    }
+  ]
+}

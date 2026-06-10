@@ -1,0 +1,790 @@
+import { t } from '../../utils/translations';
+
+type ShortcutConfig = {
+  key: string;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  altKey: boolean;
+  shiftKey: boolean;
+};
+
+type AppConfig = {
+  shortcut: ShortcutConfig;
+  bulkDeleteShortcut: ShortcutConfig;
+  enableTrashIcon: boolean;
+  directDelete: boolean;
+};
+
+const isMac = navigator.userAgent.includes('Mac');
+const DEFAULT_SHORTCUT: ShortcutConfig = {
+  key: 'Backspace',
+  ctrlKey: !isMac,
+  metaKey: isMac,
+  altKey: false,
+  shiftKey: false,
+};
+
+const DEFAULT_BULK_SHORTCUT: ShortcutConfig = {
+  key: 'Backspace',
+  ctrlKey: !isMac,
+  metaKey: isMac,
+  altKey: false,
+  shiftKey: true,
+};
+
+const DEFAULT_CONFIG: AppConfig = {
+  shortcut: DEFAULT_SHORTCUT,
+  bulkDeleteShortcut: DEFAULT_BULK_SHORTCUT,
+  enableTrashIcon: false,
+  directDelete: true,
+};
+
+const PINNED_SELECTORS = [
+  '.pin-icon-container mat-icon',
+  'mat-icon[data-mat-icon-name="keep_pin"]',
+  'mat-icon[data-mat-icon-name="push_pin"]',
+].join(', ');
+
+const SIDEBAR_SELECTORS = 'nav, mat-sidenav, mat-drawer, [role="navigation"]';
+
+const ACTIVITY_LABELS = [
+  'Activity',
+  'Actividad',
+  'Activité',
+  'Aktivität',
+  'Attività',
+  'Atividade',
+  'アクティビティ',
+  '활동',
+  '活动',
+  '活動',
+  'Действия',
+  'النشاط',
+];
+
+let currentConfig: AppConfig = DEFAULT_CONFIG;
+let activeDeletePopover: HTMLElement | null = null;
+let activeDeletePopoverCleanup: (() => void) | null = null;
+let bulkDeletionInProgress = false;
+let stopBulkDeletion = false;
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function matchesShortcut(e: KeyboardEvent, config: ShortcutConfig): boolean {
+  return (
+    e.key.toLowerCase() === config.key.toLowerCase() &&
+    e.ctrlKey === config.ctrlKey &&
+    e.metaKey === config.metaKey &&
+    e.altKey === config.altKey &&
+    e.shiftKey === config.shiftKey
+  );
+}
+
+/**
+ * Finds and clicks the confirm button in the deletion dialog
+ */
+function confirmDeletion() {
+  let dialogConfirmBtn = document.querySelector('gem-button[data-test-id="confirm-button"] button') as HTMLElement;
+  
+  if (!dialogConfirmBtn) {
+      dialogConfirmBtn = Array.from(document.querySelectorAll('mat-dialog-container button, .mdc-dialog button'))
+          .find(btn => (btn.textContent?.includes('刪除') || btn.textContent?.includes('Delete')) && 
+                       !btn.textContent?.includes('取消') && !btn.textContent?.includes('Cancel') &&
+                       (btn as HTMLElement).offsetParent !== null) as HTMLElement;
+  }
+  
+  if (dialogConfirmBtn) {
+      console.log("Gemini Shortcut: Confirmation dialog detected. Performing final deletion.");
+      dialogConfirmBtn.click();
+      return true;
+  }
+  return false;
+}
+
+function findDeleteMenuItem(): HTMLElement | null {
+  const menuItems = Array.from(
+    document.querySelectorAll(
+      'button[role="menuitem"], .mat-menu-item, .mat-mdc-menu-item, [role="menuitem"], button[data-test-id="delete-button"]',
+    ),
+  );
+  return (
+    menuItems.find(
+      (item) =>
+        item.textContent?.includes('刪除') ||
+        item.textContent?.includes('Delete') ||
+        item.querySelector('mat-icon[data-mat-icon-name="delete"]'),
+    ) as HTMLElement | undefined
+  ) ?? null;
+}
+
+/**
+ * Automates the deletion of a specific conversation (from a given menu button)
+ */
+async function performDeleteSequence(menuBtn: HTMLElement, isDirectDelete: boolean) {
+  menuBtn.click();
+  await sleep(300);
+
+  const deleteBtn = findDeleteMenuItem();
+  if (!deleteBtn) {
+    console.log("Gemini Shortcut: Could not find 'Delete' menu item.");
+    document.body.click();
+    return false;
+  }
+
+  deleteBtn.click();
+  console.log('Gemini Shortcut: Delete dialog requested.');
+
+  if (isDirectDelete) {
+    await sleep(300);
+    return confirmDeletion();
+  }
+
+  console.log("Gemini Shortcut: Waiting for user's second press to confirm.");
+  return true;
+}
+
+function isConversationPinned(menuBtn: HTMLElement): boolean {
+  const row = getConversationRowElement(menuBtn);
+  if (!row) return false;
+  return !!row.querySelector(PINNED_SELECTORS);
+}
+
+function getSidebarRoots(): HTMLElement[] {
+  return Array.from(document.querySelectorAll(SIDEBAR_SELECTORS)) as HTMLElement[];
+}
+
+function findActivitySidebarMarker(): HTMLElement | null {
+  for (const sidebar of getSidebarRoots()) {
+    const links = Array.from(
+      sidebar.querySelectorAll('a, button, [role="button"], [role="link"]'),
+    ) as HTMLElement[];
+
+    for (const link of links) {
+      const label = link.textContent?.replace(/\s+/g, ' ').trim() ?? '';
+      if (!ACTIVITY_LABELS.some((activityLabel) => label === activityLabel)) {
+        continue;
+      }
+
+      return (link.closest('a, button, li, [role="listitem"]') ?? link) as HTMLElement;
+    }
+  }
+
+  return null;
+}
+
+function isAboveActivityInSidebar(element: HTMLElement): boolean {
+  if (!element.closest(SIDEBAR_SELECTORS)) {
+    return false;
+  }
+
+  const activityMarker = findActivitySidebarMarker();
+  if (!activityMarker) {
+    return true;
+  }
+
+  if (activityMarker.contains(element)) {
+    return false;
+  }
+
+  const position = activityMarker.compareDocumentPosition(element);
+  return (position & Node.DOCUMENT_POSITION_PRECEDING) !== 0;
+}
+
+function isConversationMenuButton(menuBtn: HTMLElement): boolean {
+  if (!isAboveActivityInSidebar(menuBtn)) {
+    return false;
+  }
+
+  const row =
+    menuBtn.closest('div[data-test-id="conversation"]') ??
+    getConversationRowElement(menuBtn);
+
+  if (!row) {
+    return false;
+  }
+
+  const rowText = row.textContent ?? '';
+  if (
+    rowText.includes('Update location') ||
+    rowText.includes('Based on your places')
+  ) {
+    return false;
+  }
+
+  return !!(
+    row.matches('div[data-test-id="conversation"]') ||
+    row.querySelector(
+      'div[data-test-id="conversation"], .conversation-title, .title-text, a[href*="/app/"]',
+    )
+  );
+}
+
+function findMenuButtonInConversationItem(item: Element): HTMLElement | null {
+  const menuBtn =
+    item.querySelector(
+      'button[data-test-id="actions-menu-button"], button[aria-haspopup="menu"], .conversation-actions-menu-button',
+    ) ??
+    item.querySelector('mat-icon[data-mat-icon-name="more_vert"]')?.closest('button');
+
+  return (menuBtn as HTMLElement | null) ?? null;
+}
+
+function getSidebarMenuButtons(): HTMLElement[] {
+  const menuButtons: HTMLElement[] = [];
+
+  const chatHistoryRoots = Array.from(document.querySelectorAll('.chat-history')) as HTMLElement[];
+  if (chatHistoryRoots.length > 0) {
+    chatHistoryRoots.forEach((container) => {
+      const conversationItems = Array.from(
+        container.querySelectorAll('div[data-test-id="conversation"]'),
+      );
+      conversationItems.forEach((item) => {
+        const menuBtn = findMenuButtonInConversationItem(item);
+        if (menuBtn && isConversationMenuButton(menuBtn) && !menuButtons.includes(menuBtn)) {
+          menuButtons.push(menuBtn);
+        }
+      });
+    });
+
+    if (menuButtons.length > 0) {
+      return menuButtons;
+    }
+  }
+
+  const conversationItems = Array.from(
+    document.querySelectorAll('div[data-test-id="conversation"]'),
+  );
+  conversationItems.forEach((item) => {
+    const menuBtn = findMenuButtonInConversationItem(item);
+    if (menuBtn && isConversationMenuButton(menuBtn) && !menuButtons.includes(menuBtn)) {
+      menuButtons.push(menuBtn);
+    }
+  });
+
+  if (menuButtons.length > 0) {
+    return menuButtons;
+  }
+
+  const sidebarContainers = getSidebarRoots();
+  const titleTexts = Array.from(document.querySelectorAll('.title-text'));
+  const fallbackContainers = titleTexts
+    .map((title) => title.closest('ul') || title.closest('div[role="list"]'))
+    .filter(Boolean) as HTMLElement[];
+  const allContainers = [...sidebarContainers, ...fallbackContainers];
+
+  allContainers.forEach((container) => {
+    const standardBtns = Array.from(
+      container.querySelectorAll(
+        'button[aria-haspopup="menu"], .conversation-actions-menu-button, button[data-test-id="actions-menu-button"]',
+      ),
+    ) as HTMLElement[];
+    standardBtns.forEach((btn) => {
+      if (isConversationMenuButton(btn) && !menuButtons.includes(btn)) {
+        menuButtons.push(btn);
+      }
+    });
+
+    const icons = Array.from(container.querySelectorAll('mat-icon[data-mat-icon-name="more_vert"]'));
+    icons.forEach((icon) => {
+      const btn = icon.closest('button');
+      if (btn && isConversationMenuButton(btn as HTMLElement) && !menuButtons.includes(btn)) {
+        menuButtons.push(btn as HTMLElement);
+      }
+    });
+  });
+
+  return menuButtons;
+}
+
+function findFirstUnpinnedMenuButton(): HTMLElement | null {
+  for (const btn of getSidebarMenuButtons()) {
+    if (!isConversationPinned(btn)) {
+      return btn;
+    }
+  }
+  return null;
+}
+
+function showBulkDeleteToast(message: string) {
+  const existing = document.getElementById('gqd-bulk-toast');
+  existing?.remove();
+
+  const toast = document.createElement('div');
+  toast.id = 'gqd-bulk-toast';
+  toast.textContent = message;
+  toast.style.position = 'fixed';
+  toast.style.bottom = '24px';
+  toast.style.right = '24px';
+  toast.style.zIndex = '2147483647';
+  toast.style.padding = '12px 16px';
+  toast.style.borderRadius = '12px';
+  toast.style.background = 'rgba(32, 33, 36, 0.96)';
+  toast.style.color = '#e8eaed';
+  toast.style.fontSize = '13px';
+  toast.style.boxShadow = '0 8px 24px rgba(0, 0, 0, 0.28)';
+  document.body.appendChild(toast);
+}
+
+async function bulkDeleteUnpinned() {
+  if (bulkDeletionInProgress) {
+    showBulkDeleteToast('Bulk delete already running. Press Escape to stop.');
+    return { deleted: 0, errors: 0, stopped: true };
+  }
+
+  bulkDeletionInProgress = true;
+  stopBulkDeletion = false;
+
+  let deleted = 0;
+  let errors = 0;
+  let consecutiveFailures = 0;
+
+  showBulkDeleteToast('Deleting unpinned chats... Press Escape to stop.');
+
+  while (!stopBulkDeletion) {
+    const menuBtn = findFirstUnpinnedMenuButton();
+    if (!menuBtn) break;
+
+    try {
+      const started = await performDeleteSequence(menuBtn, currentConfig.directDelete);
+      if (!started) {
+        throw new Error('Delete menu not found');
+      }
+
+      if (!currentConfig.directDelete) {
+        await sleep(300);
+        if (!confirmDeletion()) {
+          throw new Error('Confirmation dialog not found');
+        }
+      }
+
+      deleted += 1;
+      consecutiveFailures = 0;
+      showBulkDeleteToast(`Deleted ${deleted} unpinned chat${deleted === 1 ? '' : 's'}...`);
+      await sleep(900);
+    } catch (error) {
+      console.log('Gemini Shortcut: Bulk delete error.', error);
+      errors += 1;
+      consecutiveFailures += 1;
+      if (consecutiveFailures > 5) {
+        stopBulkDeletion = true;
+      }
+      await sleep(1000);
+    }
+  }
+
+  bulkDeletionInProgress = false;
+  const summary =
+    deleted > 0
+      ? `Bulk delete complete. Deleted ${deleted}${errors > 0 ? `, errors ${errors}` : ''}.`
+      : 'No unpinned chats found to delete.';
+  showBulkDeleteToast(summary);
+  setTimeout(() => document.getElementById('gqd-bulk-toast')?.remove(), 5000);
+
+  return { deleted, errors, stopped: stopBulkDeletion };
+}
+
+function closeDeletePopover() {
+  if (activeDeletePopoverCleanup) {
+    activeDeletePopoverCleanup();
+  }
+}
+
+function getConversationRowElement(menuBtn: HTMLElement): HTMLElement | null {
+  let candidate = menuBtn.parentElement;
+  let depth = 0;
+
+  while (candidate && depth < 5) {
+    // If the candidate contains a standard link or selected item, it's likely the row
+    if (candidate.querySelector('a, [aria-selected], [role="link"]') && candidate !== menuBtn.parentElement) {
+      return candidate;
+    }
+    
+    // Some Gemini UI variations might not use anchor tags. Check if candidate looks like a list item container.
+    if (candidate.tagName === 'LI' || candidate.getAttribute('role') === 'listitem' || candidate.getAttribute('role') === 'row') {
+      return candidate;
+    }
+    
+    candidate = candidate.parentElement;
+    depth++;
+  }
+
+  // Fallback: 2nd level up is typically the row in a flex layout for these menus
+  return menuBtn.parentElement?.parentElement ?? menuBtn.parentElement;
+}
+
+function showDeletePopover(anchorEl: HTMLElement, menuBtn: HTMLElement) {
+  closeDeletePopover();
+
+  const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const rowEl = getConversationRowElement(menuBtn);
+  const popover = document.createElement('button');
+  popover.className = 'gqd-delete-popover';
+  popover.type = 'button';
+  popover.textContent = t('confirmDelete', 'en');
+  popover.setAttribute('role', 'dialog');
+  popover.setAttribute('aria-modal', 'false');
+  popover.setAttribute('aria-label', 'Delete conversation confirmation');
+  popover.style.position = 'fixed';
+  popover.style.zIndex = '2147483647';
+  popover.style.display = 'flex';
+  popover.style.alignItems = 'center';
+  popover.style.justifyContent = 'center';
+  popover.style.minWidth = '112px';
+  popover.style.minHeight = '36px';
+  popover.style.padding = '0 18px';
+  popover.style.borderRadius = '999px';
+  popover.style.border = isDark ? '1px solid #dc362e' : '1px solid #b3261e';
+  popover.style.background = isDark ? '#dc362e' : '#c5221f';
+  popover.style.color = '#ffffff';
+  popover.style.fontFamily = 'inherit';
+  popover.style.fontSize = '14px';
+  popover.style.fontWeight = '600';
+  popover.style.cursor = 'pointer';
+  popover.style.whiteSpace = 'nowrap';
+  popover.style.boxShadow = isDark
+    ? '0 10px 24px rgba(0, 0, 0, 0.34)'
+    : '0 10px 24px rgba(60, 64, 67, 0.18)';
+  popover.style.transformOrigin = 'left center';
+  if (!prefersReducedMotion) {
+    popover.style.transition = 'opacity 160ms ease, transform 160ms ease';
+    popover.style.opacity = '0';
+    popover.style.transform = 'translateX(-4px) scale(0.98)';
+  }
+  popover.style.outline = 'none';
+  popover.addEventListener('mouseenter', () => {
+    popover.style.background = isDark ? '#f04f46' : '#dc362e';
+    popover.style.borderColor = isDark ? '#f04f46' : '#dc362e';
+  });
+  popover.addEventListener('mouseleave', () => {
+    popover.style.background = isDark ? '#dc362e' : '#c5221f';
+    popover.style.borderColor = isDark ? '#dc362e' : '#b3261e';
+  });
+  popover.addEventListener('focus', () => {
+    popover.style.boxShadow = isDark
+      ? '0 0 0 3px rgba(138, 180, 248, 0.55), 0 10px 24px rgba(0, 0, 0, 0.34)'
+      : '0 0 0 3px rgba(26, 115, 232, 0.28), 0 10px 24px rgba(60, 64, 67, 0.18)';
+  });
+  popover.addEventListener('blur', () => {
+    popover.style.boxShadow = isDark
+      ? '0 10px 24px rgba(0, 0, 0, 0.34)'
+      : '0 10px 24px rgba(60, 64, 67, 0.18)';
+  });
+
+  popover.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    closeDeletePopover();
+    performDeleteSequence(menuBtn, true);
+  });
+  document.body.appendChild(popover);
+
+  const referenceRect = (rowEl ?? anchorEl).getBoundingClientRect();
+  const popoverRect = popover.getBoundingClientRect();
+  const spacing = 12;
+  let left = referenceRect.right + spacing;
+  if (left + popoverRect.width > window.innerWidth - 8) {
+    left = referenceRect.left - popoverRect.width - spacing;
+  }
+  left = Math.max(8, left);
+  const top = Math.min(
+    Math.max(8, referenceRect.top + (referenceRect.height - popoverRect.height) / 2),
+    window.innerHeight - popoverRect.height - 8,
+  );
+
+  popover.style.left = `${left}px`;
+  popover.style.top = `${top}px`;
+  if (!prefersReducedMotion) {
+    requestAnimationFrame(() => {
+      popover.style.opacity = '1';
+      popover.style.transform = 'translateX(0) scale(1)';
+    });
+  }
+  requestAnimationFrame(() => popover.focus());
+
+  const handlePointerDown = (event: MouseEvent) => {
+    const target = event.target as Node | null;
+    if (!target) return;
+    if (popover.contains(target) || anchorEl.contains(target)) return;
+    closeDeletePopover();
+  };
+
+  const handleKeyDown = (event: KeyboardEvent) => {
+    if (event.key === 'Escape') {
+      closeDeletePopover();
+    }
+  };
+
+  activeDeletePopover = popover;
+  activeDeletePopoverCleanup = () => {
+    document.removeEventListener('mousedown', handlePointerDown, true);
+    document.removeEventListener('keydown', handleKeyDown, true);
+    popover.remove();
+    activeDeletePopover = null;
+    activeDeletePopoverCleanup = null;
+  };
+
+  document.addEventListener('mousedown', handlePointerDown, true);
+  document.addEventListener('keydown', handleKeyDown, true);
+}
+
+/**
+ * Triggers the deletion flow for the active conversation
+ */
+async function triggerDeletionFlow() {
+  // 1. First, check if the final confirmation dialog is ALREADY visible
+  if (confirmDeletion()) return;
+
+  console.log("Gemini Shortcut: Dialog not detected. Identifying active conversation...");
+
+  // 2. Find the menu button for the active conversation
+  // Prioritize the top right "three dots" menu for the current conversation
+  let activeChatMenuBtn: Element | null = null;
+  const moreVertIcons = Array.from(document.querySelectorAll('mat-icon[data-mat-icon-name="more_vert"]'));
+  const possibleButtons = moreVertIcons
+    .map(icon => icon.closest('button'))
+    .filter(btn => btn !== null && btn.offsetParent !== null) as HTMLElement[];
+  
+  // Usually the top right one is not inside the nav sidebar
+  activeChatMenuBtn = possibleButtons.find(btn => !btn.closest('nav, mat-sidenav, mat-drawer, [role="navigation"]')) || null;
+  
+  if (!activeChatMenuBtn) {
+      // Fallback to old sidebar logic
+      activeChatMenuBtn = document.querySelector('nav [aria-selected="true"] + button, mat-sidenav [aria-selected="true"] + button') ||
+                          document.querySelector('a.conversation.selected + button.conversation-actions-menu-button') || 
+                          document.querySelector('.conversation-container[aria-selected="true"] button[aria-haspopup="menu"]');
+      
+      if (!activeChatMenuBtn) {
+          const selectedLink = document.querySelector('nav [aria-selected="true"]') || document.querySelector('a.conversation.selected');
+          if (selectedLink && selectedLink.parentElement) {
+              activeChatMenuBtn = selectedLink.parentElement.querySelector('button[aria-haspopup="menu"]');
+          }
+      }
+  }
+
+  if (activeChatMenuBtn) {
+      void performDeleteSequence(activeChatMenuBtn as HTMLElement, currentConfig.directDelete);
+  } else {
+      console.log("Gemini Shortcut: Could not find active conversation (likely a new chat).");
+  }
+}
+
+function handleKeyDown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && bulkDeletionInProgress) {
+    stopBulkDeletion = true;
+    showBulkDeleteToast('Stopping after the current chat...');
+    return;
+  }
+
+  if (matchesShortcut(e, currentConfig.bulkDeleteShortcut)) {
+    e.preventDefault();
+    e.stopPropagation();
+    void bulkDeleteUnpinned();
+    return;
+  }
+
+  if (matchesShortcut(e, currentConfig.shortcut)) {
+    // Check if we are focusing on an input, textarea or a prompt area
+    const target = e.target as HTMLElement;
+    const activeNodeName = target.nodeName;
+    const isEditable = target.isContentEditable;
+    
+    // We sometimes WANT to delete the chat even if the prompt input is focused but EMPTY
+    // Because Gemini auto-focuses the chat box when page loads.
+    if (activeNodeName === 'INPUT' || activeNodeName === 'TEXTAREA' || isEditable) {
+        // Check if the input is actually empty. If it has text, then user is typing, we shouldn't delete.
+        const textContent = (target as HTMLInputElement).value || target.textContent;
+        
+        // If user has typed something, let them use the shortcut for text manipulation instead
+        if (textContent && textContent.trim().length > 0) {
+            return; 
+        }
+    }
+    
+    // If we are in an empty editor or not in editor at all, trigger deletion.
+    e.preventDefault();
+    e.stopPropagation();
+    
+    triggerDeletionFlow();
+  }
+}
+
+// -----------------------------------------------------
+// CONFIGURATION SYNC
+// -----------------------------------------------------
+
+function applyConfig(configToApply: AppConfig) {
+  currentConfig = {
+    ...DEFAULT_CONFIG,
+    ...configToApply,
+    bulkDeleteShortcut: {
+      ...DEFAULT_BULK_SHORTCUT,
+      ...configToApply.bulkDeleteShortcut,
+    },
+    enableTrashIcon: false,
+    directDelete: true,
+  };
+  console.log('Gemini Chat Cleaner config loaded:', currentConfig);
+  
+  if (currentConfig.enableTrashIcon) {
+    document.body.classList.add('gqd-trash-enabled');
+  } else {
+    document.body.classList.remove('gqd-trash-enabled');
+  }
+}
+
+chrome.storage.sync.get(['geminiQuickDeleteConfig', 'geminiQuickDeleteShortcut'], (result) => {
+  if (result.geminiQuickDeleteConfig) {
+    applyConfig(result.geminiQuickDeleteConfig);
+  } else if (result.geminiQuickDeleteShortcut) {
+    applyConfig({ ...DEFAULT_CONFIG, shortcut: result.geminiQuickDeleteShortcut });
+  }
+  
+  window.addEventListener('keydown', handleKeyDown, true);
+  initTrashIconsObserver();
+});
+
+chrome.storage.onChanged.addListener((changes, namespace) => {
+  if (namespace === 'sync' && changes.geminiQuickDeleteConfig) {
+    applyConfig(changes.geminiQuickDeleteConfig.newValue);
+  }
+});
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.type === 'BULK_DELETE_UNPINNED') {
+    void bulkDeleteUnpinned().then(sendResponse);
+    return true;
+  }
+  return false;
+});
+
+// -----------------------------------------------------
+// TRASH ICON INJECTION
+// -----------------------------------------------------
+
+function createTrashIcon(menuBtn: HTMLElement) {
+  const wrapper = document.createElement('button');
+  wrapper.className = 'gqd-trash-btn';
+  wrapper.type = 'button';
+  wrapper.setAttribute('aria-label', 'Delete conversation');
+  
+  // Clean inline styles. No absolute positioning.
+  wrapper.style.display = 'none';
+  wrapper.style.alignItems = 'center';
+  wrapper.style.justifyContent = 'center';
+  wrapper.style.width = '32px';
+  wrapper.style.height = '32px';
+  wrapper.style.minWidth = '32px';
+  wrapper.style.minHeight = '32px';
+  wrapper.style.borderRadius = '10px';
+  wrapper.style.border = 'none';
+  wrapper.style.backgroundColor = 'transparent';
+  wrapper.style.color = '#8ab4f8';
+  wrapper.style.cursor = 'pointer';
+  wrapper.style.padding = '6px';
+  wrapper.style.margin = '0 4px 0 0'; // 4px margin to the right (between trash and 3-dots)
+  wrapper.style.boxSizing = 'border-box';
+  wrapper.style.flexShrink = '0'; // Don't let flexbox crush it
+  wrapper.style.transition = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    ? 'none'
+    : 'background-color 160ms ease, color 160ms ease, box-shadow 160ms ease';
+  
+  wrapper.innerHTML = `
+    <svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="3 6 5 6 21 6"></polyline>
+      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+    </svg>
+  `;
+  
+  wrapper.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (confirmDeletion()) return;
+
+    if (activeDeletePopover && activeDeletePopover.contains(e.target as Node)) {
+      return;
+    }
+
+    if (currentConfig.directDelete) {
+      void performDeleteSequence(menuBtn, true);
+      return;
+    }
+
+    showDeletePopover(wrapper, menuBtn);
+  });
+
+  // Handle active states independently of global CSS
+  wrapper.addEventListener('mouseenter', () => {
+    // Dark mode check via simple media query in JS
+    const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    wrapper.style.backgroundColor = isDark ? 'rgba(220, 54, 46, 0.18)' : 'rgba(197, 34, 31, 0.14)';
+    wrapper.style.color = isDark ? '#ff8a80' : '#b3261e';
+  });
+  
+  wrapper.addEventListener('mouseleave', () => {
+    const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    wrapper.style.backgroundColor = 'transparent';
+    wrapper.style.color = isDark ? '#8ab4f8' : '#5f6368';
+  });
+
+  wrapper.addEventListener('focus', () => {
+    const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    wrapper.style.boxShadow = isDark
+      ? '0 0 0 2px rgba(242, 184, 181, 0.32)'
+      : '0 0 0 2px rgba(217, 48, 37, 0.2)';
+  });
+
+  wrapper.addEventListener('blur', () => {
+    wrapper.style.boxShadow = 'none';
+  });
+
+  return wrapper;
+}
+
+// Observe DOM for new conversation items
+function initTrashIconsObserver() {
+  const observer = new MutationObserver(() => {
+    if (!currentConfig.enableTrashIcon) return;
+
+    const menuButtons = getSidebarMenuButtons().filter((btn) => !btn.classList.contains('gqd-processed'));
+
+    menuButtons.forEach(btn => {
+      btn.classList.add('gqd-processed');
+      const container = btn.parentElement;
+      const hoverTarget = getConversationRowElement(btn as HTMLElement) ?? container;
+      if (container) {
+        container.classList.add('gqd-convo-container');
+        // Prevent duplicate icons
+        if (!container.querySelector('.gqd-trash-btn')) {
+          const trashBtn = createTrashIcon(btn as HTMLElement);
+          
+          // Ensure the container aligns children horizontally
+          container.style.display = 'flex';
+          container.style.flexDirection = 'row';
+          container.style.alignItems = 'center';
+          
+          // Insert BEFORE the 3-dots menu button, placing it cleanly in the flex row
+          container.insertBefore(trashBtn, btn);
+          
+          // Manage hover state via JS to absolutely avoid CSS layout side effects
+          hoverTarget?.addEventListener('mouseenter', () => {
+            if (currentConfig.enableTrashIcon) {
+              trashBtn.style.display = 'inline-flex';
+              // Keep text color in sync with system theme when showing
+              const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+              trashBtn.style.color = isDark ? '#8ab4f8' : '#5f6368';
+            }
+          });
+          
+          hoverTarget?.addEventListener('mouseleave', () => {
+            trashBtn.style.display = 'none';
+          });
+        }
+      }
+    });
+  });
+
+  observer.observe(document.body, { childList: true, subtree: true });
+}
